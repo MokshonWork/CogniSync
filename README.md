@@ -100,9 +100,10 @@ Then open http://localhost:5173 in your browser.
 | `DDG_TIMEOUT` | no | DuckDuckGo search timeout in seconds (default 20) |
 | `GITHUB_TOKEN` | no | GitHub integration token (read-only official REST API; without it, public repos at lower rate limits) |
 | `NOTION_TOKEN` | no | Notion internal integration secret; share pages with the integration in Notion |
-| `VITE_API_URL` | no | Frontend override for the backend URL (default `http://localhost:8001`) |
+| `VITE_API_URL` | no | Frontend override for the backend URL (default `http://localhost:8001`); set in `frontend/.env` |
 
-See `.env.example` for full placeholders. `.env` is gitignored and never committed.
+See `.env.example` for backend placeholders and `frontend/.env.example` for the
+frontend override. `.env` files are gitignored and never committed.
 
 ## API Endpoints (backend, port 8001)
 
