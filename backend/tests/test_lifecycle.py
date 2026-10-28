@@ -164,13 +164,8 @@ async def test_events_chairman_failure_falls_back_to_stage1_success():
 # --- storage ----------------------------------------------------------------
 
 
-def test_storage_title_and_dedupe_and_updated_at(tmp_path, monkeypatch):
+def test_storage_title_and_dedupe_and_updated_at():
     from backend import storage
-    from backend.config import DATA_DIR
-
-    monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
-    import backend.config as config
-    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
 
     conv = storage.create_conversation("t-conv-1")
     assert conv["title"] == "New Conversation"
@@ -192,25 +187,6 @@ def test_storage_title_and_dedupe_and_updated_at(tmp_path, monkeypatch):
     entry = next(c for c in listing if c["id"] == "t-conv-1")
     assert entry["title"] == "What is a black hole?"
     assert entry["message_count"] == 3
-
-
-def test_list_conversations_tolerates_malformed(tmp_path, monkeypatch):
-    from backend import storage
-    import backend.config as config
-
-    monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
-
-    storage.create_conversation("good-1")
-    (tmp_path / "bad.json").write_text("{corrupt")
-    (tmp_path / "no-id.json").write_text(json.dumps({"title": "x"}))
-    storage.create_conversation("good-2")
-
-    # Empty conversations never surface as history records by default.
-    assert [c["id"] for c in storage.list_conversations()] == []
-    ids = [c["id"] for c in storage.list_conversations(include_empty=True)]
-    assert "good-1" in ids and "good-2" in ids
-    assert "no-id.json" not in ids and "bad.json" not in ids
 
 
 # --- free-mode model validation ---------------------------------------------
@@ -246,7 +222,6 @@ async def test_conversation_message_persists_user_and_result(tmp_path, monkeypat
     from backend import main, storage
 
     monkeypatch.setenv("FREE_TESTING_MODE", "true")
-    storage.ensure_data_dir()
     cid = str(uuid.uuid4())
     storage.create_conversation(cid)
 
@@ -323,7 +298,6 @@ async def test_events_stream_generator_persists_exactly_one_user_message(tmp_pat
     from backend import main, storage
     from backend.main import _run_council_events_stream
 
-    storage.ensure_data_dir()
     cid = str(uuid.uuid4())
     storage.create_conversation(cid)
 
@@ -346,8 +320,9 @@ async def test_events_stream_generator_persists_exactly_one_user_message(tmp_pat
          patch("backend.model_catalog.get_catalog", fake_catalog), \
          patch("backend.council._build_provider", lambda: OneGood()):
         sse_strings = await collect_events(_run_council_events_stream(
-            conversation={"id": cid}, content="hello council", web_search=False,
+            content="hello council", web_search=False,
             context_parts=[], request_models=None, user_extra=None,
+            conversation_id=cid, user_id=None,
         ))
     events = parse_sse(sse_strings)
 

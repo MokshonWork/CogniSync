@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { vi, beforeEach, describe, it, expect } from 'vitest'
 
@@ -72,6 +72,19 @@ describe('HistoryView', () => {
     expect(api.getConversation).not.toHaveBeenCalled()
   })
 
+  it('requests deletion from the row without expanding or loading it', async () => {
+    const user = userEvent.setup()
+    const onDelete = vi.fn()
+    render(<HistoryView onContinue={vi.fn()} onDelete={onDelete} />)
+    const toggle = await screen.findByRole('button', { name: /2 messages/ })
+
+    await user.click(screen.getByRole('button', { name: 'Delete How do black holes work?' }))
+
+    expect(onDelete).toHaveBeenCalledWith({ id: 'c1', title: 'How do black holes work?' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(api.getConversation).not.toHaveBeenCalled()
+  })
+
   it('filters by title and shows an empty state for no matches', async () => {
     const user = userEvent.setup()
     render(<HistoryView onContinue={vi.fn()} />)
@@ -79,6 +92,18 @@ describe('HistoryView', () => {
 
     await user.type(screen.getByPlaceholderText('Search conversations...'), 'zzz')
     expect(screen.getByText('No conversations match your search.')).toBeInTheDocument()
+  })
+
+  it('refreshes immediately after a deletion elsewhere', async () => {
+    listConversations.mockResolvedValueOnce([conv]).mockResolvedValueOnce([])
+    render(<HistoryView onContinue={vi.fn()} onDelete={vi.fn()} />)
+    await screen.findByText('How do black holes work?')
+
+    act(() => {
+      window.dispatchEvent(new Event('cognisync:conversations-changed'))
+    })
+
+    await waitFor(() => expect(screen.getByText(/No conversations yet/)).toBeInTheDocument())
   })
 
   it('shows the empty-history message when the server returns nothing', async () => {

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
@@ -48,6 +48,19 @@ describe('composer', () => {
 
     rerender(<MainPanel {...baseProps} loading results={{ question: 'What is RAG?', streaming: true, model_responses: [], discussion: [] }} />)
     expect(screen.getAllByText(/What is RAG\?/).length).toBeGreaterThan(0)
+  })
+
+  it('fills and focuses the composer from the prompt library without sending', async () => {
+    render(<MainPanel {...baseProps} />)
+    const box = screen.getByPlaceholderText('Ask CogniSync anything…')
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('cognisync:use-prompt', { detail: 'Exact library prompt' }))
+    })
+
+    expect(box).toHaveValue('Exact library prompt')
+    expect(box).toHaveFocus()
+    expect(baseProps.onSend).not.toHaveBeenCalled()
   })
 
   it('ignores empty submits and never sends the same Enter twice', async () => {

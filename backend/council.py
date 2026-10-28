@@ -103,6 +103,18 @@ async def _generate_with_fallback(
     return candidate, None, None
 
 
+def _usage_counts(usage) -> tuple[int, int | None]:
+    """Return (total, output) provider tokens; output is None when unreported."""
+    if not isinstance(usage, dict):
+        return 0, None
+    total = usage.get("total_tokens")
+    output = usage.get("completion_tokens")
+    return (
+        total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else 0,
+        output if isinstance(output, int) and not isinstance(output, bool) and output >= 0 else None,
+    )
+
+
 async def stage1_collect_responses(
     user_query: str,
     search_context: str = "",
@@ -164,6 +176,7 @@ async def stage1_collect_responses(
         if hasattr(response, 'response'):
             # Candidate object
             usage = getattr(response, 'token_usage', None) or {}
+            tokens, output_tokens = _usage_counts(usage)
             stage1_results.append({
                 "model": model,
                 "provider": getattr(response, 'provider', 'openrouter'),
@@ -171,7 +184,8 @@ async def stage1_collect_responses(
                 "response": response.response,
                 "error": getattr(response, 'error', None),
                 "duration_ms": getattr(response, 'duration_ms', 0) or 0,
-                "tokens": (usage.get("total_tokens") or 0) if isinstance(usage, dict) else 0,
+                "tokens": tokens,
+                "output_tokens": output_tokens,
                 "error_category": getattr(response, 'error_category', None),
                 "fallback_used": fallback_used,
                 "error_original": original_error,
@@ -185,6 +199,8 @@ async def stage1_collect_responses(
                 "response": response.get('response', response.get('content', '')),
                 "error": response.get('error', None),
                 "duration_ms": response.get('duration_ms', 0) or 0,
+                "tokens": response.get('tokens', 0) or 0,
+                "output_tokens": response.get('output_tokens', response.get('completion_tokens')),
                 "error_category": response.get('error_category'),
                 "fallback_used": fallback_used,
                 "error_original": original_error,
@@ -678,23 +694,28 @@ async def run_council_events(
         if response is None:
             return {"model": model_id, "provider": "openrouter", "success": False,
                     "response": None, "error": "Provider returned no result.", "duration_ms": 0,
-                    "tokens": 0, "fallback_used": fallback_used, "error_original": original_error}
+                    "tokens": 0, "output_tokens": None,
+                    "fallback_used": fallback_used, "error_original": original_error}
         if hasattr(response, "response"):
             usage = getattr(response, "token_usage", None) or {}
+            tokens, output_tokens = _usage_counts(usage)
             return {"model": model_id,
                     "provider": getattr(response, "provider", "openrouter"),
                     "success": response.success,
                     "response": response.response,
                     "error": getattr(response, "error", None),
                     "duration_ms": getattr(response, "duration_ms", 0) or 0,
-                    "tokens": (usage.get("total_tokens") or 0) if isinstance(usage, dict) else 0,
+                    "tokens": tokens,
+                    "output_tokens": output_tokens,
                     "error_category": getattr(response, "error_category", None),
                     "fallback_used": fallback_used, "error_original": original_error}
         return {"model": model_id, "provider": response.get("provider", "openrouter"),
                 "success": response.get("success", True),
                 "response": response.get("response", response.get("content", "")),
                 "error": response.get("error"), "duration_ms": response.get("duration_ms", 0) or 0,
-                "tokens": 0, "fallback_used": fallback_used, "error_original": original_error}
+                "tokens": response.get("tokens", 0) or 0,
+                "output_tokens": response.get("output_tokens", response.get("completion_tokens")),
+                "fallback_used": fallback_used, "error_original": original_error}
 
     while pending:
         done = await asyncio.wait({k for k in pending}, return_when=asyncio.FIRST_COMPLETED)

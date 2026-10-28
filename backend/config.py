@@ -18,6 +18,9 @@ FREE_TESTING_MODE = os.getenv("FREE_TESTING_MODE", "true").lower() not in ("0", 
 
 # Number of council members to assemble when no explicit selection is given.
 COUNCIL_MODEL_COUNT = int(os.getenv("COUNCIL_MODEL_COUNT", "4"))
+# Explicit user selections are bounded to the normal council size. This
+# protects the shared provider quota while still allowing a genuine council.
+MAX_COUNCIL_MODELS = max(1, int(os.getenv("MAX_COUNCIL_MODELS", str(COUNCIL_MODEL_COUNT))))
 
 # ponytail: fallback ids are NOT guaranteed — they are documented historical
 # ':free' variants used only when the live catalog is unreachable. Every
@@ -56,7 +59,7 @@ RATE_LIMIT_BACKOFF_CAP_SECONDS = float(os.getenv("RATE_LIMIT_BACKOFF_CAP_SECONDS
 RATE_LIMIT_TOTAL_TIMEOUT = float(os.getenv("RATE_LIMIT_TOTAL_TIMEOUT", "90"))     # whole-request budget
 
 # Data directory for conversation storage
-DATA_DIR = "data/conversations"
+DATA_DIR = os.getenv("DATA_DIR", "data/conversations")
 
 # ---------------------------------------------------------------------------
 # DuckDuckGo Search (web search integration)
@@ -87,3 +90,20 @@ NOTION_TIMEOUT = 15.0
 
 # Connection test timeout for integration checks.
 TOOLS_TEST_TIMEOUT = 15.0
+
+# ---------------------------------------------------------------------------
+# JWT authentication
+# ---------------------------------------------------------------------------
+# Signing secret for JWT access tokens. Must be set via COGNISYNC_JWT_SECRET
+# in production. A development-only fallback is used when unset so the server
+# can start locally, but a warning is logged and insecure-mode behavior is
+# never silently enabled for remote targets.
+JWT_SECRET = os.getenv("COGNISYNC_JWT_SECRET", "dev-insecure-change-me")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+JWT_ISSUER = os.getenv("JWT_ISSUER", "cognisync")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "cognisync-api")
+
+# Data directory for user accounts
+USER_DATA_DIR = os.getenv("USER_DATA_DIR", "data/users")

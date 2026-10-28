@@ -1,8 +1,9 @@
 """FastAPI backend for CogniSync."""
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form, Depends, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import uuid
@@ -10,9 +11,26 @@ import json
 import asyncio
 import os
 import tempfile
+import warnings
 
 from . import storage
-from .config import OPENROUTER_API_KEY, COUNCIL_MODELS, CHAIRMAN_MODEL, FREE_TESTING_MODE
+from .auth import (
+    authenticate_user,
+    create_access_token,
+    create_user,
+    decode_access_token,
+    InvalidTokenError,
+    TokenStoreUnavailable,
+    revoke_token,
+)
+from .config import (
+    OPENROUTER_API_KEY,
+    COUNCIL_MODELS,
+    CHAIRMAN_MODEL,
+    FREE_TESTING_MODE,
+    MAX_COUNCIL_MODELS,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 from .query import run_query, resolve_selected
 from .ddg_search import DuckDuckGoSearchService, format_search_context
@@ -27,6 +45,120 @@ from .upload_validation import (
 from .document_processing import extract_attachment, ExtractionResult
 
 app = FastAPI(title="CogniSync API")
+
+INSECURE_JWT_SECRET = "dev-insecure-change-me"
+
+
+@app.on_event("startup")
+def startup_config_checks():
+    """Fail loudly in production on insecure defaults; warn in development.
+
+    Production is detected via the RENDER deployment environment or an
+    explicit COGNISYNC_ENV=production. Local development keeps working with
+    the dev fallback so the stack starts with zero configuration.
+    """
+    from .config import JWT_SECRET, DATABASE_URL
+
+    production = bool(os.getenv("RENDER")) or os.getenv("COGNISYNC_ENV") == "production"
+    if JWT_SECRET == INSECURE_JWT_SECRET:
+        if production:
+            raise RuntimeError(
+                "JWT secret is insecure. Set COGNISYNC_JWT_SECRET in the "
+                "production environment."
+            )
+        warnings.warn(
+            "JWT secret is the default insecure value. Set COGNISYNC_JWT_SECRET "
+            "before production deployment.",
+            stacklevel=2,
+        )
+    if production and not os.getenv("DATABASE_URL"):
+        raise RuntimeError(
+            "DATABASE_URL must be set in production; the SQLite dev fallback "
+            "is not allowed."
+        )
+
+    from .database import Base, engine
+    if engine.dialect.name == "sqlite":
+        Base.metadata.create_all(bind=engine)
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class TokenData(BaseModel):
+    user_id: str
+    username: str
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> TokenData:
+    """FastAPI dependency: validate bearer token and return the current user.
+
+    Returns 401 for missing, malformed, expired, revoked, or invalid tokens.
+    Never exposes internal exception details.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except TokenStoreUnavailable as exc:
+        # Fail-closed but explicit: without the revocation store no token can
+        # be verified, so the request cannot proceed at all.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token validation is temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
+    user_id = payload.get("sub")
+    username = payload.get("username")
+    if not user_id or not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if storage.get_user_by_id(user_id) is None:
+        # A deleted user account invalidates outstanding tokens immediately,
+        # even though a signed token's claims would otherwise remain valid.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return TokenData(user_id=user_id, username=username)
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user_id: str
+    username: str
+
+
+class UserMe(BaseModel):
+    user_id: str
+    username: str
 
 # Enable CORS for local development
 app.add_middleware(
@@ -133,11 +265,106 @@ async def root():
         "free_testing": FREE_TESTING_MODE,
         "council_models": COUNCIL_MODELS,
         "chairman_model": CHAIRMAN_MODEL,
+        "min_selection": 1,
+        "max_selection": MAX_COUNCIL_MODELS,
     }
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+async def register(request: RegisterRequest):
+    """Register a new user account.
+
+    Passwords are hashed with Argon2id and never stored plaintext.
+    """
+    if not request.username.strip() or not request.password:
+        raise HTTPException(status_code=400, detail="Username and password are required")
+    if len(request.username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    try:
+        user = create_user(request.username.strip(), request.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    token = create_access_token(user["id"], user["username"])
+    return AuthResponse(
+        access_token=token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user_id=user["id"],
+        username=user["username"],
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    """Authenticate a user and issue an access token."""
+    user = authenticate_user(request.username, request.password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(user["id"], user["username"])
+    return AuthResponse(
+        access_token=token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user_id=user["id"],
+        username=user["username"],
+    )
+
+
+@app.post("/auth/logout", status_code=204)
+async def logout(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    current_user: TokenData = Depends(get_current_user),
+):
+    """Revoke the current access token server-side and return 204."""
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        jti = decode_access_token(credentials.credentials).get("jti")
+    except TokenStoreUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token validation is temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+    if jti:
+        revoke_token(jti, current_user.user_id)
+    return Response(status_code=204)
+
+
+@app.post("/auth/revoke", status_code=204)
+async def revoke(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+):
+    """Explicitly revoke the supplied access token (immediate logout)."""
+    if credentials is None:
+        return Response(status_code=204)
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except (InvalidTokenError, TokenStoreUnavailable):
+        return Response(status_code=204)
+    jti = payload.get("jti")
+    if jti:
+        revoke_token(jti, payload.get("sub") or "")
+    return Response(status_code=204)
+
+
+@app.get("/auth/me", response_model=UserMe)
+async def me(current_user: TokenData = Depends(get_current_user)):
+    """Return the authenticated user's profile."""
+    return UserMe(user_id=current_user.user_id, username=current_user.username)
 
 
 class QueryRequest(BaseModel):
     """Request body for POST /api/query."""
+
     question: str
     models: List[str] = []
     mode: str = "balanced"
@@ -145,7 +372,7 @@ class QueryRequest(BaseModel):
 
 
 @app.post("/api/query")
-async def query_council(request: QueryRequest):
+async def query_council(request: QueryRequest, current_user: TokenData = Depends(get_current_user)):
     """Run the full council pipeline for a single question.
 
     Returns per-model responses with timing/token counts, the chairman's
@@ -157,7 +384,7 @@ async def query_council(request: QueryRequest):
 
 
 @app.get("/api/models")
-async def models_catalog():
+async def models_catalog(current_user: TokenData = Depends(get_current_user)):
     """OpenRouter free-model catalog for the UI.
 
     Authenticated live-check data comes only from /api/tools/test or actual
@@ -174,11 +401,13 @@ async def models_catalog():
         "fallback": fallback,
         "models": models,
         "chairman_model": CHAIRMAN_MODEL,
+        "min_selection": 1,
+        "max_selection": MAX_COUNCIL_MODELS,
     }
 
 
 @app.post("/api/models/refresh")
-async def refresh_models():
+async def refresh_models(current_user: TokenData = Depends(get_current_user)):
     """Force a catalog re-fetch (explicit refresh action from the UI)."""
     from .model_catalog import get_catalog
 
@@ -188,6 +417,8 @@ async def refresh_models():
         "free_testing": FREE_TESTING_MODE,
         "fallback": fallback,
         "models": models,
+        "min_selection": 1,
+        "max_selection": MAX_COUNCIL_MODELS,
     }
 
 
@@ -208,7 +439,7 @@ async def _test_web_search() -> Dict[str, Any]:
 
 
 @app.post("/api/tools/test")
-async def tools_test(request: ToolTestRequest):
+async def tools_test(request: ToolTestRequest, current_user: TokenData = Depends(get_current_user)):
     """Live connection test for one integration.
 
     Frontend actions trigger this explicitly — it performs a real,
@@ -265,37 +496,37 @@ def _tool_payload(result) -> Dict[str, Any]:
 
 
 @app.post("/api/tools/github/search")
-async def github_search(request: GitHubSearchRequest):
+async def github_search(request: GitHubSearchRequest, current_user: TokenData = Depends(get_current_user)):
     """Search GitHub repositories (read-only official REST API)."""
     return _tool_payload(await GitHubClient().search_repositories(request.query, request.per_page))
 
 
 @app.post("/api/tools/github/file")
-async def github_file(request: GitHubReadRequest):
+async def github_file(request: GitHubReadRequest, current_user: TokenData = Depends(get_current_user)):
     """Read a single repository file (read-only)."""
     return _tool_payload(await GitHubClient().get_file_contents(request.owner, request.repo, request.path, request.ref))
 
 
 @app.post("/api/tools/github/issues")
-async def github_issues(request: GitHubIssuesRequest):
+async def github_issues(request: GitHubIssuesRequest, current_user: TokenData = Depends(get_current_user)):
     """List issues for a repository (read-only)."""
     return _tool_payload(await GitHubClient().list_issues(request.owner, request.repo, request.state, request.per_page))
 
 
 @app.post("/api/tools/notion/search")
-async def notion_search(request: NotionSearchRequest):
+async def notion_search(request: NotionSearchRequest, current_user: TokenData = Depends(get_current_user)):
     """Search Notion pages shared with the integration (read-only)."""
     return _tool_payload(await NotionClient().search_pages(request.query))
 
 
 @app.post("/api/tools/notion/page")
-async def notion_page(request: NotionPageRequest):
+async def notion_page(request: NotionPageRequest, current_user: TokenData = Depends(get_current_user)):
     """Retrieve a Notion page's text content (read-only)."""
     return _tool_payload(await NotionClient().get_page_content(request.page_id))
 
 
 @app.get("/api/tools/status")
-async def tools_status():
+async def tools_status(current_user: TokenData = Depends(get_current_user)):
     """Integration configuration status.
 
     Reports only server-side configuration state — 'configured' means the
@@ -331,33 +562,59 @@ async def tools_status():
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
-async def list_conversations():
-    """List all conversations (metadata only)."""
-    return storage.list_conversations()
+async def list_conversations(current_user: TokenData = Depends(get_current_user)):
+    """List the authenticated user's conversations (metadata only)."""
+    return storage.list_conversations(user_id=current_user.user_id)
 
 
 @app.post("/api/conversations", response_model=Conversation)
-async def create_conversation(request: CreateConversationRequest):
-    """Create a new conversation."""
+async def create_conversation(
+    request: CreateConversationRequest,
+    current_user: TokenData = Depends(get_current_user),
+):
+    """Create a new conversation owned by the authenticated user."""
     conversation_id = str(uuid.uuid4())
-    conversation = storage.create_conversation(conversation_id)
+    conversation = storage.create_conversation(
+        conversation_id, user_id=current_user.user_id
+    )
     return conversation
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=Conversation)
-async def get_conversation(conversation_id: str):
-    """Get a specific conversation with all its messages."""
+async def get_conversation(
+    conversation_id: str,
+    current_user: TokenData = Depends(get_current_user),
+):
+    """Get a specific conversation owned by the authenticated user."""
     _require_conversation_id(conversation_id)
-    conversation = storage.get_conversation(conversation_id)
+    conversation = storage.get_conversation_for_user(
+        conversation_id, current_user.user_id
+    )
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
+
+
+@app.delete("/api/conversations/{conversation_id}", status_code=204)
+async def delete_conversation(
+    conversation_id: str,
+    current_user: TokenData = Depends(get_current_user),
+):
+    """Permanently delete one conversation owned by the authenticated user."""
+    _require_conversation_id(conversation_id)
+    deleted = storage.delete_conversation_for_user(
+        conversation_id, current_user.user_id
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return Response(status_code=204)
 
 
 @app.post("/api/conversations/{conversation_id}/message")
 async def send_message(
     conversation_id: str,
     request: SendMessageRequest,
+    current_user: TokenData = Depends(get_current_user),
 ):
     """Send a message and run the 3-stage council process.
 
@@ -365,11 +622,11 @@ async def send_message(
     ``attachments`` metadata.     This endpoint is for text-only or text-plus-previously-uploaded-attachments messages.
     """
     _require_conversation_id(conversation_id)
-    if storage.get_conversation(conversation_id) is None:
+    if storage.get_conversation_for_user(conversation_id, current_user.user_id) is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Run the full council (attachments metadata only) and return the result.
-    result = await _process_and_run_council(conversation_id, request)
+    result = await _process_and_run_council(conversation_id, request, user_id=current_user.user_id)
     return result
 
 
@@ -388,6 +645,10 @@ async def _resolve_request_models(chosen: Optional[List[str]] = None) -> Dict[st
         return await resolve_council_models(COUNCIL_MODEL_COUNT)
 
     ids = list(dict.fromkeys(m for m in chosen if isinstance(m, str) and m.strip()))
+    if len(ids) > MAX_COUNCIL_MODELS:
+        raise _ModelSelectionError(
+            f"Select at most {MAX_COUNCIL_MODELS} council models."
+        )
     catalog_models, _fallback = await get_catalog()
     free_ids = {m["id"] for m in catalog_models if m.get("free", True)}
     names = {m["id"]: m["name"] for m in catalog_models}
@@ -446,6 +707,10 @@ class _PaidModelError(Exception):
         super().__init__("paid model ids not eligible in free-testing mode")
 
 
+class _ModelSelectionError(Exception):
+    """A valid request shape that exceeds the configured council capacity."""
+
+
 
 def _history_context(conversation: Dict[str, Any], max_turns: int = 6) -> str:
     """Compact prior-turn context for follow-ups in the same session.
@@ -481,6 +746,7 @@ async def _prepare_council_run(
     web_search: bool,
     context_parts: List[str],
     user_extra: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Persist the user message and compose the effective council question.
 
@@ -497,9 +763,11 @@ async def _prepare_council_run(
     }
     if user_extra:
         user_entry.update(user_extra)
-    storage.add_user_message(conversation_id, json.dumps(user_entry))
+    storage.add_user_message(conversation_id, json.dumps(user_entry), user_id=user_id)
 
-    history_block = _history_context(storage.get_conversation(conversation_id) or conversation)
+    history_block = _history_context(
+        storage.get_conversation(conversation_id, user_id=user_id) or conversation
+    )
 
     search_context: Optional[str] = None
     sources: Optional[List[Dict[str, Any]]] = None
@@ -555,6 +823,7 @@ def _finalize_council_result(
     resolved: Dict[str, Any],
     label_to_model: Optional[Dict[str, str]] = None,
     aggregate: Optional[List[Dict[str, Any]]] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Map display names, persist the assistant message, build the payload.
 
@@ -592,6 +861,7 @@ def _finalize_council_result(
     storage.add_assistant_message(
         conversation_id, stage1_results, stage2_results, stage3_result, metadata=metadata,
         final_answer=final_answer, final_answer_error=final_answer_error, sources=sources,
+        user_id=user_id,
     )
 
     return {
@@ -611,24 +881,39 @@ def _sse(event: Dict[str, Any]) -> str:
 
 
 async def _run_council_events_stream(
-    conversation: Optional[Dict[str, Any]],
     content: str,
     web_search: bool,
     context_parts: List[str],
     request_models: Optional[List[str]] = None,
     user_extra: Optional[Dict[str, Any]] = None,
     conversation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """SSE generator: persisted user message, then progressive council events.
 
-    When the conversation does not exist yet, it is created only AFTER the
-    model selection validates — a rejected request never creates an empty
-    history record.
+    When the conversation does not exist yet, it is created (owned by
+    ``user_id``) only AFTER the model selection validates — a rejected
+    request never creates an empty history record. A conversation that
+    exists but belongs to someone else is never written to.
     """
     import asyncio
 
     from .council import run_council_events
 
+    conversation: Optional[Dict[str, Any]] = None
+    if conversation_id:
+        existing = storage.get_conversation_for_user(conversation_id, user_id or "")
+        if existing is None:
+            unowned = storage.get_conversation(conversation_id)
+            if unowned is not None and user_id is not None:
+                # Exists but belongs to another user (or is legacy-unowned):
+                # never write into it from an authenticated context.
+                yield _sse({"type": "error", "error": 404, "message": "Conversation not found.", "stage1": []})
+                yield _sse({"type": "done"})
+                return
+            conversation = unowned
+        else:
+            conversation = existing
     conversation_id = conversation_id or (conversation or {}).get("id")
     if not conversation_id:
         yield _sse({"type": "error", "error": 400, "message": "Missing conversation id."})
@@ -639,6 +924,10 @@ async def _run_council_events_stream(
     # invalid request never leaves a dangling conversation or message.
     try:
         resolved = await _resolve_request_models(request_models)
+    except _ModelSelectionError as exc:
+        yield _sse({"type": "error", "error": 400, "message": str(exc), "stage1": []})
+        yield _sse({"type": "done"})
+        return
     except _PaidModelError as exc:
         yield _sse({"type": "error", "error": 400, "message": (
             "Free-testing mode: these model ids are not free-eligible in the current catalog: "
@@ -653,7 +942,7 @@ async def _run_council_events_stream(
         return
 
     if conversation is None:
-        conversation = storage.create_conversation(conversation_id)
+        conversation = storage.create_conversation(conversation_id, user_id=user_id)
 
     if "alternatives" not in resolved:
         from .model_catalog import get_catalog as _get_cat2
@@ -661,7 +950,7 @@ async def _run_council_events_stream(
         resolved["alternatives"] = _build_alternatives(resolved["ids"], cat_models2)
 
     prepared = await _prepare_council_run(
-        conversation, content, web_search, context_parts, user_extra
+        conversation, content, web_search, context_parts, user_extra, user_id
     )
     yield _sse({"type": "session", "conversation_id": conversation_id,
                 "web_search": prepared["search_metadata"]})
@@ -705,7 +994,8 @@ async def _run_council_events_stream(
                     conversation_id, stage1_results, stage2_results, stage3_result,
                     {}, prepared["search_metadata"], prepared["sources"], resolved,
                     label_to_model={}, aggregate=[],
-                )
+                user_id=user_id,
+    )
                 yield _sse({"type": "final", "payload": final})
                 yield _sse({"type": "done"})
                 return
@@ -735,7 +1025,8 @@ async def _run_council_events_stream(
             conversation_id, stage1_results, stage2_results, stage3_result,
             {}, prepared["search_metadata"], prepared["sources"], resolved,
             label_to_model=label_to_model, aggregate=aggregate,
-        )
+        user_id=user_id,
+    )
         yield _sse({"type": "final", "payload": final})
         yield _sse({"type": "done"})
         return
@@ -752,6 +1043,7 @@ async def _run_council_events_stream(
         conversation_id, stage1_results, stage2_results, stage3_result,
         {}, prepared["search_metadata"], prepared["sources"], resolved,
         label_to_model=label_to_model, aggregate=aggregate,
+    user_id=user_id,
     )
     yield _sse({"type": "final", "payload": final})
     yield _sse({"type": "done"})
@@ -764,6 +1056,7 @@ async def _run_council_for_request(
     context_parts: List[str],
     request_models: Optional[List[str]] = None,
     user_extra: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the council (blocking) with attachments/search/history context and persist.
 
@@ -773,13 +1066,15 @@ async def _run_council_for_request(
     """
     try:
         resolved = await _resolve_request_models(request_models)
+    except _ModelSelectionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except _PaidModelError as exc:
         raise HTTPException(status_code=400, detail=(
             "Free-testing mode: these model ids are not free-eligible in the current catalog: "
             + ", ".join(exc.ids)
         )) from exc
 
-    prepared = await _prepare_council_run(conversation, content, web_search, context_parts, user_extra)
+    prepared = await _prepare_council_run(conversation, content, web_search, context_parts, user_extra, user_id)
     search_metadata = prepared["search_metadata"]
     if "alternatives" not in resolved:
         from .model_catalog import get_catalog as _get_cat2
@@ -819,12 +1114,20 @@ async def _run_council_for_request(
         metadata, search_metadata, prepared["sources"], resolved,
         label_to_model=metadata.get("label_to_model") or None,
         aggregate=None,
+        user_id=user_id,
     )
 
 
-async def _process_and_run_council(conversation_id: str, request: SendMessageRequest):
+async def _process_and_run_council(
+    conversation_id: str,
+    request: SendMessageRequest,
+    user_id: Optional[str] = None,
+):
     """Process attachments metadata and run the council with combined context."""
-    conversation = storage.get_conversation(conversation_id) or {"id": conversation_id}
+    if user_id:
+        conversation = storage.get_conversation_for_user(conversation_id, user_id) or {"id": conversation_id}
+    else:
+        conversation = storage.get_conversation(conversation_id) or {"id": conversation_id}
 
     # Attachments sent as metadata from a prior upload have no bytes here.
     context_parts = [
@@ -837,6 +1140,7 @@ async def _process_and_run_council(conversation_id: str, request: SendMessageReq
         web_search=request.web_search,
         context_parts=context_parts,
         request_models=request.models,
+        user_id=user_id,
     )
 
 
@@ -847,6 +1151,7 @@ async def _process_and_run_council(conversation_id: str, request: SendMessageReq
 async def send_message_events(
     conversation_id: str,
     request: SendMessageRequest,
+    current_user: TokenData = Depends(get_current_user),
 ):
     """Send a message and stream the council run as Server-Sent Events.
 
@@ -858,16 +1163,15 @@ async def send_message_events(
     are persisted exactly once either way.
     """
     _require_conversation_id(conversation_id)
-    conversation = storage.get_conversation(conversation_id)
 
     return StreamingResponse(
         _run_council_events_stream(
-            conversation=conversation,
             content=request.content,
             web_search=request.web_search,
             context_parts=[],
             request_models=request.models,
             conversation_id=conversation_id,
+            user_id=current_user.user_id,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -881,6 +1185,7 @@ async def send_message_stream(
     content: str = Form(...),
     web_search: bool = Form(False),
     files: List[UploadFile] = File(default=[]),
+    current_user: TokenData = Depends(get_current_user),
 ):
     """Send a message with optional file attachments.
 
@@ -892,7 +1197,7 @@ async def send_message_stream(
     Returns the full council result JSON (same shape as ``/message``).
     """
     _require_conversation_id(conversation_id)
-    conversation = storage.get_conversation(conversation_id)
+    conversation = storage.get_conversation_for_user(conversation_id, current_user.user_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -1020,6 +1325,7 @@ async def send_message_stream(
             "attachment_metadata": attachment_meta_list,
             "validation_errors": validation_errors,
         },
+        user_id=current_user.user_id,
     )
     result["metadata"]["attachment_count"] = len(files)
     result["metadata"]["attachment_metadata"] = attachment_meta_list

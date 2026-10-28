@@ -18,7 +18,7 @@ describe('model catalog fetch', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       'http://localhost:8001/api/models/refresh',
-      { method: 'POST' },
+      { method: 'POST', headers: {} },
     )
   })
 
@@ -31,7 +31,7 @@ describe('model catalog fetch', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       'http://localhost:8001/api/models',
-      { method: 'GET' },
+      { method: 'GET', headers: {} },
     )
   })
 })

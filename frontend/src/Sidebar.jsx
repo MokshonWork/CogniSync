@@ -13,7 +13,7 @@ function fmtDate(iso) {
   return d ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : ''
 }
 
-export default function Sidebar({ collapsed, onToggle, onNewSession, onViewChange, view, onOpenConversation }) {
+export default function Sidebar({ collapsed, onToggle, onNewSession, onViewChange, view, onOpenConversation, onDelete, user, onLogout }) {
   const [recents, setRecents] = useState([])
 
   const refresh = useCallback(() => {
@@ -96,15 +96,26 @@ export default function Sidebar({ collapsed, onToggle, onNewSession, onViewChang
                 <li className="py-1 text-[12px] text-neutral-400">No sessions yet</li>
               )}
               {recents.map((r) => (
-                <li key={r.id}>
+                <li key={r.id} className="group flex items-center gap-1">
                   <button
                     onClick={() => onOpenConversation(r.id)}
-                    className="flex w-full items-center justify-between rounded-md px-2 py-1.5 hover:bg-black/5 text-left"
+                    className="flex min-w-0 flex-1 items-center justify-between rounded-md px-2 py-1.5 hover:bg-black/5 text-left"
                     title={r.title}
                   >
-                    <span className="w-[150px] truncate text-[13px] text-neutral-600">{r.title}</span>
-                    <span className="text-[11px] text-neutral-400">{r.date}</span>
+                    <span className="min-w-0 flex-1 truncate text-[13px] text-neutral-600">{r.title}</span>
+                    <span className="ml-2 shrink-0 text-[11px] text-neutral-400">{r.date}</span>
                   </button>
+                  {onDelete && (
+                    <button
+                      type="button"
+                      onClick={() => onDelete({ id: r.id, title: r.title })}
+                      aria-label={`Delete ${r.title}`}
+                      title="Delete conversation"
+                      className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-neutral-400 hover:bg-red-50 hover:text-red-500 lg:h-8 lg:w-8"
+                    >
+                      <Icon name="trash" size={12} />
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
@@ -112,14 +123,23 @@ export default function Sidebar({ collapsed, onToggle, onNewSession, onViewChang
 
           <div className="mt-auto mb-4 flex items-center gap-3 px-4">
             <div className="relative shrink-0">
-              <img src={avatar} alt="Sahil" className="h-8 w-8 rounded-full object-cover" />
+              <img src={avatar} alt={user?.username || 'Account'} className="h-8 w-8 rounded-full object-cover" />
               <span className="absolute -bottom-0 -right-0 h-2.5 w-2.5 rounded-full border-2 border-sidebar bg-gpt" />
             </div>
             <div className="flex-1">
-              <div className="text-[13px] font-medium text-ink">Sahil</div>
-              <div className="text-[11px] text-neutral-400">Free plan</div>
+              <div className="truncate text-[13px] font-medium text-ink">{user?.username || 'Account'}</div>
+              <div className="text-[11px] text-neutral-400">Signed in</div>
             </div>
-            <span className="label-xs rounded-full border border-black/10 px-2 py-0.5 text-neutral-500">FREE</span>
+            {onLogout && (
+              <button
+                type="button"
+                onClick={onLogout}
+                className="label-xs rounded-full border border-black/10 px-2 py-0.5 text-neutral-500 hover:bg-black/5 hover:text-ink"
+                title="Sign out"
+              >
+                Log out
+              </button>
+            )}
           </div>
         </>
       )}

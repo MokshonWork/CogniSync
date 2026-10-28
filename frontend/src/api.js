@@ -1,41 +1,57 @@
+import { authHeaders, handleAuthError } from './auth.js'
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001'
 
 // Keeps the legacy `api` object for the older components/* tree.
 export const api = {
   async listConversations() {
-    const res = await fetch(`${API_BASE}/api/conversations`)
+    const res = await fetch(`${API_BASE}/api/conversations`, { headers: authHeaders() })
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
     if (!res.ok) throw new Error('Failed to list conversations')
     return res.json()
   },
   async createConversation() {
     const res = await fetch(`${API_BASE}/api/conversations`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({}),
     })
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
     if (!res.ok) throw new Error('Failed to create conversation')
     return res.json()
   },
   async getConversation(conversationId) {
-    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`)
+    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, { headers: authHeaders() })
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
     if (!res.ok) throw new Error('Failed to get conversation')
     return res.json()
+  },
+  async deleteConversation(conversationId) {
+    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, { method: 'DELETE', headers: authHeaders() })
+    if (!res.ok) {
+      if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
+      let detail = `Failed to delete conversation: ${res.status}`
+      try { detail = (await res.json()).detail || detail } catch { /* empty 204/error body */ }
+      throw new Error(detail)
+    }
   },
   async sendMessage(conversationId, content) {
     const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/message`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ content }),
     })
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
     if (!res.ok) throw new Error('Failed to send message')
     return res.json()
   },
   async sendMessageStream(conversationId, content, onEvent) {
     const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/message/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ content }),
     })
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
     if (!res.ok) throw new Error('Failed to send message')
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -63,9 +79,10 @@ export const api = {
 export async function queryCouncil({ question, models = [], mode = 'balanced', webSearch = false }) {
   const res = await fetch(`${API_BASE}/api/query`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ question, models, mode, web_search: webSearch }),
   })
+  if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
   if (!res.ok) {
     let detail = `Query failed: ${res.status}`
     try { detail = (await res.json()).detail || detail } catch { /* non-JSON error */ }
@@ -80,9 +97,10 @@ export async function queryCouncil({ question, models = [], mode = 'balanced', w
 export async function sendCouncilMessage(conversationId, { content, webSearch = false }) {
   const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/message`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ content, web_search: webSearch }),
   })
+  if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
   if (!res.ok) {
     let detail = `Message failed: ${res.status}`
     try { detail = (await res.json()).detail || detail } catch { /* non-JSON error body */ }
@@ -101,10 +119,11 @@ export async function sendCouncilMessage(conversationId, { content, webSearch = 
 export async function runCouncilStream(conversationId, { content, models, webSearch = false }, onEvent, signal) {
   const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/message/events`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers: authHeaders({ 'Content-Type': 'application/json', Accept: 'text/event-stream' }),
     body: JSON.stringify({ content, web_search: webSearch, models }),
     signal,
   })
+  if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
   if (!res.ok) {
     let detail = `Council request failed: ${res.status}`
     try { const body = await res.json(); detail = body.detail || detail } catch { /* non-JSON body */ }
@@ -147,10 +166,11 @@ export async function runCouncilStream(conversationId, { content, models, webSea
 export async function testTool(name) {
   const res = await fetch(`${API_BASE}/api/tools/test`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ name }),
   })
   const data = await res.json().catch(() => ({}))
+  if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
   if (!res.ok && !data.error) throw new Error(`Test failed: ${res.status}`)
   return { name, ...data }
 }
@@ -158,25 +178,26 @@ export async function testTool(name) {
 // Read-only GitHub / Notion tool invocations
 export async function githubSearch(query) {
   const res = await fetch(`${API_BASE}/api/tools/github/search`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query }),
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ query }),
   })
   return res.json()
 }
 export async function githubIssues(owner, repo) {
   const res = await fetch(`${API_BASE}/api/tools/github/issues`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner, repo }),
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ owner, repo }),
   })
   return res.json()
 }
 export async function notionSearch(query) {
   const res = await fetch(`${API_BASE}/api/tools/notion/search`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query }),
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ query }),
   })
   return res.json()
 }
 
 export async function getToolsStatus() {
-  const res = await fetch(`${API_BASE}/api/tools/status`)
+  const res = await fetch(`${API_BASE}/api/tools/status`, { headers: authHeaders() })
+  if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
   if (!res.ok) throw new Error('Failed to load tools status')
   return res.json()
 }

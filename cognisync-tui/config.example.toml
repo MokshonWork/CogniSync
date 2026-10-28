@@ -1,0 +1,4 @@
+# The same backend configured by frontend/.env's VITE_API_URL.
+backend_url = "http://localhost:8001"
+# Set false only if you deliberately connect to a local HTTP development server.
+allow_insecure_http = true

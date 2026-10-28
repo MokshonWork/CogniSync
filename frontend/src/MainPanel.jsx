@@ -2,8 +2,12 @@ import { useState, useEffect, useRef } from 'react'
 import { Icon, familyIcon } from './icons.jsx'
 import { exposeModelCatalog, cachedModels } from './catalog.js'
 import ModelCard from './ModelCard.jsx'
+import ModelPerformance from './ModelPerformance.jsx'
+import ModelComparison from './ModelComparison.jsx'
 import DiscussionTimeline from './DiscussionTimeline.jsx'
 import Markdown from './Markdown.jsx'
+import SpeechControls from './SpeechControls.jsx'
+import { rankingOutcome } from './rankings.js'
 
 const CHIPS = ['Compare different approaches', 'Analyze a trade-off', 'Challenge my assumptions']
 
@@ -115,6 +119,7 @@ export default function MainPanel({
   }, [results?.question])
 
   const finalAnswer = results?.final_answer || ''
+  const ranking = rankingOutcome(results?.aggregate_rankings, results?.peer_reviews)
 
   // Reveal the final answer exactly once per run, only when the user has not
   // scrolled away to read earlier content, and never on a failed run.
@@ -257,6 +262,16 @@ export default function MainPanel({
           </div>
         </div>
       )}
+      <ModelPerformance responses={results?.model_responses || []} loading={loading} models={models} />
+      <ModelComparison
+        responses={results?.model_responses || []}
+        aggregateRankings={results?.aggregate_rankings || []}
+        peerReviews={results?.peer_reviews || []}
+        criteria={results?.evaluation_criteria || []}
+        loading={loading}
+        models={models}
+      />
+
       <div className="mt-4 grid gap-5 md:grid-cols-1 xl:grid-cols-2">
         <section className="min-w-0 rounded-2xl border border-black/10 bg-white p-5">
           <h2 className="text-[14px] font-semibold text-ink">Model Responses</h2>
@@ -289,9 +304,19 @@ export default function MainPanel({
 
       {finalAnswer && (
         <section ref={finalRef} id="final-answer" className="mt-5 scroll-mt-4 rounded-2xl border border-gpt/20 bg-gpt/[0.04] p-5">
-          <h2 className="text-[14px] font-semibold text-ink">Final Answer</h2>
-          {results.synthesis_model && <p className="mt-0.5 text-[11px] text-neutral-400">{results.synthesis_model}</p>}
-          <Markdown className="mt-3 text-[13px] leading-relaxed text-neutral-700">{finalAnswer}</Markdown>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-[14px] font-semibold text-ink">Final Answer</h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <SpeechControls text={finalAnswer} />
+              <span className="label-xs rounded-full bg-gpt/10 px-2 py-1 text-gpt">Consensus synthesis</span>
+            </div>
+          </div>
+          <p className="mt-0.5 text-[11px] text-neutral-400">
+            {results.synthesis_model ? `Synthesized by ${results.synthesis_model}` : 'Chairman synthesis'}
+            {ranking.winner && ` · ${ranking.winner.model} led peer review (avg rank ${ranking.winner.average_rank})`}
+            {ranking.tied && ` · Peer review tied at average rank ${ranking.leaders[0].average_rank}`}
+          </p>
+          <Markdown className="mt-3 max-w-[76ch] text-[14px] leading-relaxed text-neutral-700">{finalAnswer}</Markdown>
           {results?.sources?.length > 0 && (
             <ul className="mt-3 flex flex-col gap-1 text-[11px] text-neutral-400">
               {results.sources.map((s) => (

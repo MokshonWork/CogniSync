@@ -2,21 +2,14 @@
 
 Covers collapsed-list prerequisites (filtering empties), title derivation,
 newest-updated-first ordering, timestamp bumps on follow-ups, retry dedupe,
-reload from disk, and the persisted final-answer contract.
+reload from the database, and the persisted final-answer contract.
 """
 
 import json
-import os
 
 import pytest
 
 from backend import storage
-
-
-@pytest.fixture(autouse=True)
-def temp_data(tmp_path, monkeypatch):
-    monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
-    return tmp_path
 
 
 def _add_turn(conv_id, question, answer="Answer", success=True, final_answer=None):
@@ -52,20 +45,6 @@ def test_title_truncates_long_prompts():
     assert title.endswith("…")
 
 
-def test_legacy_new_conversation_title_is_derived_on_read(tmp_path):
-    # Simulate an old saved record with a placeholder title but a real prompt.
-    legacy = {
-        "id": "legacy",
-        "created_at": "2025-01-01T00:00:00",
-        "updated_at": "2025-01-01T00:00:00",
-        "title": "New Conversation",
-        "messages": [{"role": "user", "content": "Explain RAG in one paragraph"}],
-    }
-    (tmp_path / "legacy.json").write_text(json.dumps(legacy))
-    assert storage.get_conversation("legacy")["title"] == "Explain RAG in one paragraph"
-    assert storage.list_conversations()[0]["title"] == "Explain RAG in one paragraph"
-
-
 def test_empty_sessions_are_not_history_records():
     storage.create_conversation("empty-1")
     storage.create_conversation("empty-2")
@@ -98,8 +77,7 @@ def test_newest_updated_conversation_first_and_follow_up_bumps():
     assert listing[0]["created_at"] < listing[0]["updated_at"]
 
 
-def test_equal_timestamps_sort_deterministically(monkeypatch):
-    monkeypatch.setattr(storage, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+def test_equal_timestamps_sort_deterministically():
     for cid in ("a", "b", "c"):
         storage.create_conversation(cid)
         _add_turn(cid, f"question {cid}")
@@ -109,21 +87,13 @@ def test_equal_timestamps_sort_deterministically(monkeypatch):
     assert set(first) == {"a", "b", "c"}
 
 
-def test_updated_at_is_iso_utc_with_zone():
-    storage.create_conversation("c1")
-    _add_turn("c1", "Question")
-    updated = storage.list_conversations()[0]["updated_at"]
-    assert updated.endswith("Z")
-
-
 # --- persistence / retries --------------------------------------------------
 
 
-def test_conversation_reloads_from_disk_after_restart():
+def test_conversation_reloads_from_database_after_restart():
     storage.create_conversation("persisted")
     _add_turn("persisted", "Survives restarts", final_answer="Yes it does")
 
-    # Nothing is cached in-process: every read comes from the JSON file.
     reloaded = storage.get_conversation("persisted")
     assert reloaded["messages"][0]["role"] == "user"
     assert reloaded["messages"][-1]["final_answer"] == "Yes it does"
@@ -171,19 +141,16 @@ def test_final_answer_and_sources_are_persisted():
     assert assistant["sources"][0]["url"] == "https://a.example"
 
 
-def test_legacy_messages_without_final_answer_still_load():
-    legacy = {
-        "id": "old",
-        "created_at": "2025-01-01T00:00:00",
-        "title": "Old",
-        "messages": [
-            {"role": "user", "content": "q"},
-            {"role": "assistant", "stage1": [], "stage2": [], "stage3": {"model": "m", "response": "legacy answer", "success": True}},
-        ],
-    }
-    os.makedirs(storage.DATA_DIR, exist_ok=True)
-    with open(storage.get_conversation_path("old"), "w") as f:
-        json.dump(legacy, f)
-    conv = storage.get_conversation("old")
-    assert conv["messages"][-1]["stage3"]["response"] == "legacy answer"
-    assert conv["messages"][-1].get("final_answer") is None  # frontend falls back to stage3
+# --- ownership ---------------------------------------------------------------
+
+
+def test_user_scoped_list_and_read_isolation():
+    storage.create_conversation("a-owned", user_id="owner-1")
+    storage.create_conversation("b-owned", user_id="owner-2")
+    storage.add_user_message("a-owned", "Owner one's question", user_id="owner-1")
+
+    assert [c["id"] for c in storage.list_conversations(user_id="owner-1")] == ["a-owned"]
+    assert storage.list_conversations(user_id="owner-2") == []
+    # Ownership filter: a different user gets a 404-equivalent None.
+    assert storage.get_conversation("a-owned", user_id="owner-2") is None
+    assert storage.get_conversation_for_user("a-owned", "owner-2") is None

@@ -1,68 +1,113 @@
-"""JSON-based storage for conversations.
+"""Conversational storage for CogniSync.
 
-Writes are atomic (temp file + os.replace) so a crash mid-write can never
-corrupt a saved conversation, and a process-wide lock serializes the
-read-modify-write cycles that append messages.
+PostgreSQL-backed (SQLAlchemy ORM, models in backend.models), with the
+SQLite fallback engine from backend.database for local development/tests.
 
-Empty conversations are never listed: a conversation becomes visible in
-history only after its first user message is persisted.
+Preserves the legacy dict-shaped API the app and tests rely on:
+
+- user messages are stored verbatim (may be a plain string or a JSON
+  envelope with ``content``);
+- assistant messages serialize the full 3-stage entry ({stage1, stage2,
+  stage3, final_answer, final_answer_error, sources, metadata}) as JSON in
+  the content column and are re-materialized as a dict on read;
+- titles derive from the first meaningful user message;
+- empty conversations are never listed by default;
+- retries do not duplicate turns.
+
+Ownership: every function takes an optional ``user_id``. When supplied
+(production always does), reads/writes/deletes are scoped to it; ``None``
+targets only unowned conversations. Unowned conversations cannot be
+created through the API — they exist only for legacy data import.
 """
 
 import json
-import os
+import logging
 import re
-import tempfile
-import threading
+import uuid as uuid_module
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-from pathlib import Path
-from .config import DATA_DIR
+from typing import Any, Dict, List, Optional
 
-_LOCK = threading.RLock()
+from sqlalchemy.orm import Session
+
+from .database import get_db
+from .models import Conversation, Message, User
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TITLE = "New Conversation"
 TITLE_MAX_LENGTH = 72
 
-# ponytail: one conservative filename alphabet for both UUIDs and legacy ids.
-# Rejects separators, dot segments, NULs, and encoded junk before any join.
+# One conservative id alphabet; API paths are UUIDs, but direct callers get
+# defense in depth against separators/traversal here too.
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
-def ensure_data_dir():
-    """Ensure the data directory exists."""
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-
-
-def get_conversation_path(conversation_id: str) -> str:
-    """Get the validated file path for a conversation.
-
-    Defense in depth for direct storage callers: only safe filename ids are
-    accepted, and the resolved path must stay inside DATA_DIR (so a symlink
-    cannot redirect reads/writes outside the configured store).
-    """
+def validate_conversation_id(conversation_id: str) -> None:
     if not isinstance(conversation_id, str) or not _CONVERSATION_ID_RE.fullmatch(conversation_id):
         raise ValueError("Invalid conversation id")
-    root = Path(DATA_DIR).resolve()
-    path = (root / f"{conversation_id}.json").resolve()
-    try:
-        path.relative_to(root)
-    except ValueError:
-        raise ValueError("Invalid conversation id") from None
-    return str(path)
 
 
-def _save_atomic(path: str, data: Dict[str, Any]) -> None:
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+def _session() -> Session:
+    return next(get_db())
+
+
+def _no_owner(user_id: Optional[str]) -> bool:
+    return user_id is None or user_id == ""
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+
+def create_user(username: str, password: str, user_id: Optional[str] = None) -> User:
+    """Create a new user with an Argon2id-hashed password."""
+    from sqlalchemy.exc import IntegrityError
+
+    from .auth import hash_password
+
+    user_id = user_id if user_id is not None else str(uuid_module.uuid4())
+    db_user = User(id=user_id, username=username, hashed_password=hash_password(password))
+
+    db = _session()
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
+    except IntegrityError:
+        db.rollback()
+        raise ValueError(f"Username '{username}' is already taken") from None
+    except Exception:
+        db.rollback()
         raise
+    finally:
+        db.close()
+
+
+def get_user_by_id(user_id: str) -> Optional[User]:
+    db = _session()
+    try:
+        return db.query(User).filter(User.id == user_id).first()
+    finally:
+        db.close()
+
+
+def get_user_by_username(username: str) -> Optional[User]:
+    db = _session()
+    try:
+        return db.query(User).filter(User.username == username).first()
+    finally:
+        db.close()
+
+
+def user_exists(username: str) -> bool:
+    return get_user_by_username(username) is not None
+
+
+# ---------------------------------------------------------------------------
+# Titles / content helpers (legacy semantics)
+# ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
@@ -84,11 +129,7 @@ def _decode_content(content: Any) -> str:
 
 
 def _title_from_content(content: Any) -> str:
-    """Derive a short readable title from the first meaningful user message.
-
-    Normalizes all whitespace (newlines, tabs, repeated spaces) and truncates
-    to a single readable line. Returns "" when there is no meaningful text.
-    """
+    """Derive a short readable title from the first meaningful user message."""
     text = " ".join(_decode_content(content).split())
     if not text:
         return ""
@@ -98,12 +139,7 @@ def _title_from_content(content: Any) -> str:
 
 
 def _derive_title(conversation: Dict[str, Any]) -> str:
-    """Stored title when meaningful, otherwise the first user message.
-
-    Legacy records may still carry "New Conversation" even though they have a
-    user prompt; deriving on read keeps history honest without rewriting
-    existing files.
-    """
+    """Stored title when meaningful, otherwise the first user message."""
     stored = (conversation.get("title") or "").strip()
     if stored and stored != DEFAULT_TITLE:
         return stored
@@ -115,17 +151,6 @@ def _derive_title(conversation: Dict[str, Any]) -> str:
     return DEFAULT_TITLE
 
 
-def _normalize(conversation: Dict[str, Any]) -> Dict[str, Any]:
-    conversation.setdefault("messages", [])
-    if not isinstance(conversation["messages"], list):
-        conversation["messages"] = []
-    if "created_at" not in conversation:
-        conversation["created_at"] = _now_iso()
-    if "title" not in conversation:
-        conversation["title"] = DEFAULT_TITLE
-    return conversation
-
-
 def _is_failed_assistant(message: Dict[str, Any]) -> bool:
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return False
@@ -133,132 +158,306 @@ def _is_failed_assistant(message: Dict[str, Any]) -> bool:
     return stage3.get("success") is False
 
 
-def create_conversation(conversation_id: str) -> Dict[str, Any]:
-    """Create a new, empty conversation with a stable id."""
-    ensure_data_dir()
-    now = _now_iso()
-    conversation = {
-        "id": conversation_id,
-        "created_at": now,
-        "updated_at": now,
-        "title": DEFAULT_TITLE,
-        "messages": [],
+# ---------------------------------------------------------------------------
+# Conversation operations
+# ---------------------------------------------------------------------------
+
+
+def create_conversation(
+    conversation_id: str,
+    user_id: Optional[str] = None,
+    title: str = DEFAULT_TITLE,
+) -> Dict[str, Any]:
+    """Create a new, empty conversation owned by ``user_id`` (may be None)."""
+    validate_conversation_id(conversation_id)
+    db_conv = Conversation(
+        id=conversation_id,
+        title=title,
+        user_id=user_id or None,
+    )
+    db = _session()
+    try:
+        db.add(db_conv)
+        db.commit()
+        db.refresh(db_conv)
+        logger.info("Created conversation %s for user %s", conversation_id, user_id or "none")
+        return _conversation_dict(db, db_conv)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _conversation_messages(req_db: Session, conversation_id: str) -> List[Dict[str, Any]]:
+    rows = (
+        req_db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.id.asc())
+        .all()
+    )
+    return [_message_dict(m) for m in rows]
+
+
+def _message_dict(m: Message) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "id": m.id,
+        "role": m.role,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
     }
-    with _LOCK:
-        _save_atomic(get_conversation_path(conversation_id), conversation)
-    return conversation
+    if m.role == "assistant" and isinstance(m.content, str):
+        try:
+            payload = json.loads(m.content)
+            if isinstance(payload, dict):
+                entry.update(payload)
+        except (ValueError, TypeError):
+            entry["content"] = m.content
+        entry.setdefault("content", m.content)
+        entry["stage1"] = entry.get("stage1") or []
+        entry["stage2"] = entry.get("stage2") or []
+    else:
+        entry["content"] = m.content
+    return entry
 
 
-def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
-    """Load a conversation from storage (title derived for legacy records)."""
-    path = get_conversation_path(conversation_id)
-    if not os.path.exists(path):
+def _conversation_dict(db: Session, conv: Conversation) -> Dict[str, Any]:
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "user_id": conv.user_id,
+        "created_at": conv.created_at.isoformat() if conv.created_at else None,
+        "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        "messages": _conversation_messages(db, conv.id),
+    }
+
+
+def get_conversation(
+    conversation_id: str,
+    user_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load a conversation; when ``user_id`` is given it must match the owner."""
+    validate_conversation_id(conversation_id)
+    db = _session()
+    try:
+        query = db.query(Conversation).filter(Conversation.id == conversation_id)
+        if user_id is not None:
+            query = query.filter(Conversation.user_id == user_id)
+        conv = query.first()
+        if conv is None:
+            return None
+        return _conversation_dict(db, conv)
+    finally:
+        db.close()
+
+
+def get_conversation_for_user(
+    conversation_id: str,
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Strictly ownership-checked read (API contract)."""
+    validate_conversation_id(conversation_id)
+    if not user_id:
         return None
-    with _LOCK:
-        with open(path, "r") as f:
-            data = json.load(f)
-    if not isinstance(data, dict):
-        return None
-    _normalize(data)
-    if data.get("title") == DEFAULT_TITLE:
-        data["title"] = _derive_title(data)
-    return data
+    db = _session()
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id)
+            .filter(Conversation.user_id == user_id)
+            .first()
+        )
+        if conv is None:
+            return None
+        return _conversation_dict(db, conv)
+    finally:
+        db.close()
 
 
-def save_conversation(conversation: Dict[str, Any]):
-    """Save a conversation atomically, bumping ``updated_at`` (last activity)."""
-    ensure_data_dir()
-    _normalize(conversation)
-    if conversation.get("title") == DEFAULT_TITLE:
-        derived = _derive_title(conversation)
-        if derived != DEFAULT_TITLE:
-            conversation["title"] = derived
-    conversation["updated_at"] = _now_iso()
-    with _LOCK:
-        _save_atomic(get_conversation_path(conversation["id"]), conversation)
+def get_conversations_for_user(
+    user_id: str,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    db = _session()
+    try:
+        query = (
+            db.query(Conversation)
+            .filter(Conversation.user_id == user_id)
+            .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
+        )
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        return [_conversation_dict(db, c) for c in query.all()]
+    finally:
+        db.close()
 
 
-def list_conversations(include_empty: bool = False) -> List[Dict[str, Any]]:
+def list_conversations(
+    user_id: Optional[str] = None,
+    include_empty: bool = False,
+) -> List[Dict[str, Any]]:
     """List conversation metadata, newest activity first.
 
-    Args:
-        include_empty: Include conversations with zero messages. Defaults to
-            False so a session that never produced a user message never
-            appears as a misleading "New Conversation" history record.
-
-    Malformed or unreadable records are skipped rather than failing the
-    whole history listing.
+    ``user_id`` scopes to one owner; None lists every user (legacy/tests).
+    Malformed records are skipped rather than failing the whole listing.
     """
-    ensure_data_dir()
-    conversations: List[Dict[str, Any]] = []
+    db = _session()
+    try:
+        query = db.query(Conversation).order_by(
+            Conversation.updated_at.desc(),
+            Conversation.created_at.desc(),
+            Conversation.id.desc(),
+        )
+        if user_id is not None:
+            query = query.filter(Conversation.user_id == user_id)
+        conversations: List[Dict[str, Any]] = []
+        for conv in query.all():
+            messages = _conversation_messages(db, conv.id)
+            entry = {
+                "id": conv.id,
+                "title": conv.title,
+                "user_id": conv.user_id,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+                "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+                "message_count": len(messages),
+            }
+            if entry["message_count"] or include_empty:
+                entry["title"] = _derive_title(
+                    {"title": conv.title, "messages": messages}
+                )
+                conversations.append(entry)
+        # Newest last activity first; deterministic tie-break so ordering
+        # never jitters between equal timestamps.
+        conversations.sort(
+            key=lambda c: (c["updated_at"] or "", c["created_at"] or "", c["id"]),
+            reverse=True,
+        )
+        return conversations
+    finally:
+        db.close()
 
-    for filename in os.listdir(DATA_DIR):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(DATA_DIR, filename)
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue  # transient write or corrupt record: skip, never crash
-        if not isinstance(data, dict) or not data.get("id"):
-            continue
-        _normalize(data)
-        message_count = len(data["messages"])
-        if message_count == 0 and not include_empty:
-            continue
-        conversations.append({
-            "id": data["id"],
-            "created_at": data.get("created_at", ""),
-            "updated_at": data.get("updated_at") or data.get("created_at", ""),
-            "title": _derive_title(data),
-            "message_count": message_count,
-        })
 
-    # Newest last activity first; deterministic tie-break for equal
-    # timestamps (created_at, then id) so ordering never jitters.
-    conversations.sort(
-        key=lambda c: (c["updated_at"] or "", c["created_at"] or "", c["id"]),
-        reverse=True,
-    )
-    return conversations
+def delete_conversation_for_user(
+    conversation_id: str,
+    user_id: str,
+) -> bool:
+    """Delete one conversation, ownership-checked."""
+    validate_conversation_id(conversation_id)
+    db = _session()
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id)
+            .filter(Conversation.user_id == user_id)
+            .first()
+        )
+        if conv is None:
+            return False
+        db.delete(conv)
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-def add_user_message(conversation_id: str, content: str):
-    """Append a user message, idempotent for retries.
+def update_conversation_title(
+    conversation_id: str,
+    title: str,
+    user_id: Optional[str] = None,
+) -> bool:
+    """Update the title; ownership-checked when ``user_id`` is supplied."""
+    validate_conversation_id(conversation_id)
+    db = _session()
+    try:
+        query = db.query(Conversation).filter(Conversation.id == conversation_id)
+        if user_id is not None:
+            query = query.filter(Conversation.user_id == user_id)
+        conv = query.first()
+        if conv is None:
+            return False
+        conv.title = title
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-    A retry is detected when the stored conversation ends with either the
-    same user message (assistant result not persisted yet) or an identical
-    user message followed by a failed assistant result. In the latter case
-    the failed result is removed so the retry's outcome replaces it instead
-    of duplicating the turn.
-    """
-    with _LOCK:
-        conversation = get_conversation(conversation_id)
-        if conversation is None:
-            raise ValueError(f"Conversation {conversation_id} not found")
 
-        messages = conversation["messages"]
-        if messages and messages[-1].get("role") == "user" and messages[-1].get("content") == content:
-            return
-        if (len(messages) >= 2
-                and _is_failed_assistant(messages[-1])
-                and messages[-2].get("role") == "user"
-                and messages[-2].get("content") == content):
-            # Retry of a failed turn: drop the failed result and keep the
+def _touch_updated_at(conversation_id: str) -> None:
+    db2 = _session()
+    try:
+        conv = db2.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if conv is not None:
+            conv.updated_at = datetime.now(timezone.utc)
+            db2.commit()
+    except Exception:
+        db2.rollback()
+        raise
+    finally:
+        db2.close()
+
+
+# ---------------------------------------------------------------------------
+# Message operations
+# ---------------------------------------------------------------------------
+
+
+def add_user_message(
+    conversation_id: str,
+    content: str,
+    user_id: Optional[str] = None,
+) -> Message:
+    """Append a user message, idempotent for retries (see module docstring)."""
+    validate_conversation_id(conversation_id)
+    db = _session()
+    try:
+        query = db.query(Conversation).filter(Conversation.id == conversation_id)
+        if not _no_owner(user_id):
+            query = query.filter(Conversation.user_id == user_id)
+        else:
+            query = query.filter(Conversation.user_id.is_(None))
+        conv = query.first()
+        if conv is None:
+            raise ValueError(
+                f"Conversation {conversation_id} not found for user {user_id or 'none'}"
+            )
+
+        tail = _conversation_messages(db, conversation_id)
+        if tail and tail[-1].get("role") == "user" and tail[-1].get("content") == content:
+            return db.query(Message).filter(Message.id == tail[-1]["id"]).first()
+        if (
+            len(tail) >= 2
+            and _is_failed_assistant(tail[-1])
+            and tail[-2].get("role") == "user"
+            and tail[-2].get("content") == content
+        ):
+            # Retry of a failed turn: drop the failed result, keep the
             # already-persisted user message (no duplicate append).
-            messages.pop()
-            save_conversation(conversation)
-            return
+            db.query(Message).filter(Message.id == tail[-1]["id"]).delete()
+            db.commit()
+            _touch_updated_at(conversation_id)
+            return None
 
-        messages.append({"role": "user", "content": content, "created_at": _now_iso()})
-
-        if conversation.get("title", DEFAULT_TITLE) == DEFAULT_TITLE:
+        msg = Message(conversation_id=conversation_id, role="user", content=content)
+        db.add(msg)
+        if conv.title in (None, DEFAULT_TITLE):
             title = _title_from_content(content)
             if title:
-                conversation["title"] = title
-
-        save_conversation(conversation)
+                conv.title = title
+        db.commit()
+        db.refresh(msg)
+        _touch_updated_at(conversation_id)
+        return msg
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def add_assistant_message(
@@ -270,34 +469,71 @@ def add_assistant_message(
     final_answer: Optional[str] = None,
     final_answer_error: Optional[str] = None,
     sources: Optional[List[Dict[str, Any]]] = None,
-):
+    user_id: Optional[str] = None,
+) -> Message:
     """Append an assistant message carrying all 3 stages and the final answer."""
-    with _LOCK:
-        conversation = get_conversation(conversation_id)
-        if conversation is None:
-            raise ValueError(f"Conversation {conversation_id} not found")
+    validate_conversation_id(conversation_id)
+    entry = {
+        "stage1": stage1,
+        "stage2": stage2,
+        "stage3": stage3,
+        "final_answer": final_answer,
+        "final_answer_error": final_answer_error,
+    }
+    if sources:
+        entry["sources"] = sources
+    if metadata is not None:
+        entry["metadata"] = metadata
 
-        entry = {
-            "role": "assistant",
-            "stage1": stage1,
-            "stage2": stage2,
-            "stage3": stage3,
-            "final_answer": final_answer,
-            "final_answer_error": final_answer_error,
-        }
-        if sources:
-            entry["sources"] = sources
-        if metadata is not None:
-            entry["metadata"] = metadata
-        conversation["messages"].append(entry)
-        save_conversation(conversation)
+    db = _session()
+    try:
+        query = db.query(Conversation).filter(Conversation.id == conversation_id)
+        if not _no_owner(user_id):
+            query = query.filter(Conversation.user_id == user_id)
+        else:
+            query = query.filter(Conversation.user_id.is_(None))
+        if query.first() is None:
+            raise ValueError(
+                f"Conversation {conversation_id} not found for user {user_id or 'none'}"
+            )
+        msg = Message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=json.dumps(entry),
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+        _touch_updated_at(conversation_id)
+        return msg
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-def update_conversation_title(conversation_id: str, title: str):
-    """Update the title of a conversation."""
-    with _LOCK:
-        conversation = get_conversation(conversation_id)
-        if conversation is None:
-            raise ValueError(f"Conversation {conversation_id} not found")
-        conversation["title"] = title
-        save_conversation(conversation)
+def get_messages_for_conversation(
+    conversation_id: str,
+    user_id: str,
+) -> List[Message]:
+    """All messages for an owned conversation (strict ownership check)."""
+    validate_conversation_id(conversation_id)
+    db = _session()
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id)
+            .filter(Conversation.user_id == user_id)
+            .first()
+        )
+        if conv is None:
+            return []
+        return list(
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.id.asc())
+            .all()
+        )
+    finally:
+        db.close()

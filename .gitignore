@@ -22,6 +22,9 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 
+# Rust build output
+cognisync-tui/target/
+
 # Logs and temporary files
 *.log
 logs/
@@ -33,6 +36,14 @@ logs/
 # Local runtime conversations
 data/conversations/*
 !data/conversations/.gitkeep
+
+# Local user records (Argon2 hashes — never commit)
+data/users/*
+!data/users/.gitkeep
+
+# Local SQLite dev fallback and throwaway artifacts
+cognisync-dev.db
+*.db*/
 
 # Operating system artifacts
 .DS_Store

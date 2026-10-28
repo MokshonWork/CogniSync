@@ -3,6 +3,8 @@ import { Icon, familyIcon } from './icons.jsx'
 import { getToolsStatus } from './api.js'
 import { useModelCatalog } from './catalog.js'
 import Markdown from './Markdown.jsx'
+import SpeechControls from './SpeechControls.jsx'
+import { rankingOutcome } from './rankings.js'
 
 function FinalAnswerOverlay({ answer, onClose }) {
   useEffect(() => {
@@ -26,6 +28,9 @@ function FinalAnswerOverlay({ answer, onClose }) {
             ✕
           </button>
         </div>
+        <div className="border-b border-black/5 px-5 py-2">
+          <SpeechControls text={answer} />
+        </div>
         <div className="overflow-y-auto px-5 py-4">
           <Markdown className="text-[14px] leading-relaxed text-neutral-700">{answer}</Markdown>
         </div>
@@ -43,6 +48,7 @@ export default function RightPanel({ results, webSearch, onToggleWebSearch, sele
   const finalAnswer = results?.final_answer || ''
   const finalError = results?.final_answer_error || null
   const pending = !!results?.streaming && !finalAnswer && !finalError
+  const ranking = rankingOutcome(results?.aggregate_rankings, results?.peer_reviews)
 
   useEffect(() => {
     getToolsStatus()
@@ -144,12 +150,23 @@ export default function RightPanel({ results, webSearch, onToggleWebSearch, sele
         <p className="mt-0.5 text-[11px] leading-snug text-neutral-400">
           The chairman weighs every voice and consensus vote.
         </p>
+        {ranking.winner && (
+          <p className="mt-1 text-[11px] leading-snug text-neutral-500">
+            Peer review: <span className="font-medium text-ink">{ranking.winner.model}</span> ranked first
+            {' '}(avg rank {ranking.winner.average_rank}).
+          </p>
+        )}
+        {ranking.tied && (
+          <p className="mt-1 text-[11px] leading-snug text-neutral-500">
+            Peer review is tied at average rank {ranking.leaders[0].average_rank}; no single winner is declared.
+          </p>
+        )}
 
         {/* green bar chart: tokens per model */}
         <div className="mt-3 flex h-20 items-end gap-2 border-b border-black/10 px-1 pb-0">
           {active.map((m, i) => {
             const r = results?.model_responses?.find((res) => res.model_id === m.key || res.model === m.name)
-            const h = maxTokens > 0 && r ? Math.max(8, Math.round((r.tokens / maxTokens) * 100)) : 8 + i * 4
+            const h = maxTokens > 0 && r?.tokens ? Math.max(8, Math.round((r.tokens / maxTokens) * 100)) : 0
             return (
               <div key={m.key} className="flex flex-1 flex-col items-center gap-1">
                 <div
@@ -167,6 +184,7 @@ export default function RightPanel({ results, webSearch, onToggleWebSearch, sele
 
         {finalAnswer && (
           <>
+            <SpeechControls text={finalAnswer} className="mt-3" />
             <Markdown className="mt-3 max-h-64 overflow-y-auto text-[12px] leading-relaxed text-neutral-600">
               {finalAnswer}
             </Markdown>

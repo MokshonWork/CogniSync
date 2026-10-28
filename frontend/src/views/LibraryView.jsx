@@ -4,11 +4,11 @@ import { Icon } from '../icons.jsx'
 // Built-in prompts are static; user prompts persist in localStorage only
 // (no prompt-storage backend exists — nothing here claims server sync).
 const BUILT_IN = [
-  { id: 'b1', category: 'Analysis', title: 'Compare two approaches', text: 'Compare the main approaches to solve a problem, listing strengths, weaknesses, and when each is the better choice.' },
-  { id: 'b2', category: 'Decision', title: 'Analyze a trade-off', text: 'I need to decide between [option A] and [option B]. Walk through the trade-offs and recommend one.' },
-  { id: 'b3', category: 'Reasoning', title: 'Challenge assumptions', text: 'Here is my argument: [argument]. Identify hidden assumptions and attack the weakest points.' },
-  { id: 'b4', category: 'Writing', title: 'Sharpen writing', text: 'Rewrite this to be clearer and more concise without losing meaning: [text]' },
-  { id: 'b5', category: 'Code', title: 'Code review', text: 'Review this code for bugs, edge cases, and simpler alternatives: [code]' },
+  { id: 'b1', category: 'Analysis', title: 'Compare two approaches', text: 'Compare the main approaches to solve a problem, listing strengths, weaknesses, trade-offs, assumptions, and the situations in which each approach is the better choice. End with a concise comparison table and a recommendation based on the stated priorities.' },
+  { id: 'b2', category: 'Decision', title: 'Analyze a trade-off', text: 'I need to decide between [option A] and [option B]. Compare them against my goals, constraints, cost, implementation effort, risks, reversibility, and long-term consequences. Identify the information that could change the decision, then recommend one option with a clear rationale. If critical context is missing, state your assumptions.' },
+  { id: 'b3', category: 'Reasoning', title: 'Challenge assumptions', text: 'Here is my argument: [argument]. Identify its explicit and hidden assumptions, examine the evidence supporting each major claim, find logical gaps and counterexamples, and present the strongest opposing argument. Distinguish facts from speculation and suggest how the argument could be improved.' },
+  { id: 'b4', category: 'Writing', title: 'Sharpen writing', text: 'Rewrite the following text to make it clearer, more concise, and better structured without changing its intended meaning: [text]. Preserve important details, use natural language, remove unnecessary repetition, and briefly explain any substantial changes.' },
+  { id: 'b5', category: 'Code', title: 'Code review', text: 'Review the following code for correctness, security, edge cases, performance, maintainability, and simpler alternatives: [code]. Prioritize findings by severity, explain why each issue matters, and suggest concrete fixes. Do not invent bugs; distinguish confirmed issues from potential risks. If the code is sound, say so and recommend useful tests.' },
 ]
 
 const CATEGORIES = ['All', 'Analysis', 'Decision', 'Reasoning', 'Writing', 'Code', 'My prompts']

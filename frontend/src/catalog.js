@@ -3,6 +3,7 @@
 // pricing; this module is a thin cache so views don't refetch on every
 // render, and exposeModelCatalog(force) gives an explicit refresh path.
 import { useEffect, useState } from 'react'
+import { authHeaders, handleAuthError } from './auth.js'
 
 const TTL_MS = 10 * 60 * 1000
 
@@ -18,8 +19,14 @@ function colorFor(key) {
 async function fetchCatalog(force = false) {
   const base = import.meta.env.VITE_API_URL || 'http://localhost:8001'
   const path = force ? '/api/models/refresh' : '/api/models'
-  const res = await fetch(`${base}${path}`, { method: force ? 'POST' : 'GET' })
-  if (!res.ok) throw new Error(`Failed to load model catalog (${res.status})`)
+  const res = await fetch(`${base}${path}`, {
+    method: force ? 'POST' : 'GET',
+    headers: authHeaders(),
+  })
+  if (!res.ok) {
+    if (handleAuthError(res.status)) throw new Error('Signed out — please log in again')
+    throw new Error(`Failed to load model catalog (${res.status})`)
+  }
   const data = await res.json()
   const models = (data.models || []).map((m) => ({
     key: m.id,

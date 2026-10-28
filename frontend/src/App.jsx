@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Sidebar from './Sidebar.jsx'
 import MainPanel from './MainPanel.jsx'
+import DeleteConversationDialog from './DeleteConversationDialog.jsx'
 import RightPanel from './RightPanel.jsx'
 import HistoryView from './views/HistoryView.jsx'
 import LibraryView from './views/LibraryView.jsx'
@@ -8,9 +9,11 @@ import ModelsView from './views/ModelsView.jsx'
 import CompareView from './views/CompareView.jsx'
 import ToolsView from './views/ToolsView.jsx'
 import SettingsView from './views/SettingsView.jsx'
+import LoginView from './views/LoginView.jsx'
 import { api, runCouncilStream } from './api.js'
 import { mapRunToResults } from './runResults.js'
 import { loadPrefs, savePrefs } from './prefs.js'
+import { AUTH_CHANGED, AUTH_EXPIRED, getToken, getStoredUser, logoutUser, verifyToken } from './auth.js'
 
 // Peers reading persisted data (Sidebar recents, History) refresh when the
 // server-side conversation state changes.
@@ -30,6 +33,9 @@ function initialRunResults(question) {
     final_answer_error: null,
     synthesis_error: null,
     discussion: null, // null = still processing → timeline shows real progress
+    aggregate_rankings: [],
+    peer_reviews: [],
+    evaluation_criteria: [],
     search: { enabled: false },
     sources: null,
     failed: false,
@@ -49,8 +55,10 @@ function cardFromEvent(ev, names) {
     success: ev.success,
     state: ev.success ? 'completed' : 'failed',
     tokens: ev.tokens || 0,
+    output_tokens: Number.isFinite(ev.output_tokens) ? ev.output_tokens : null,
     time_ms: ev.duration_ms || 0,
     error: ev.error || null,
+    error_category: ev.error_category || null,
   }
 }
 
@@ -66,7 +74,7 @@ function applyEvent(prev, event, questionText, conversationId, myRunId, namesRef
           model_id: id,
           model: (event.names && (event.names[id] || event.names[id])) || id,
           text: '', success: null, state: 'running',
-          tokens: 0, time_ms: 0, error: null,
+          tokens: 0, output_tokens: null, time_ms: 0, error: null, error_category: null,
         }),
       }
     }
@@ -92,8 +100,20 @@ function applyEvent(prev, event, questionText, conversationId, myRunId, namesRef
           lastError: event.success ? prev.reviewProgress?.lastError : (event.error || 'review failed'),
         },
       }
-    case 'rankings':
-      return { ...prev, reviewProgress: { ...prev.reviewProgress, finished: true } }
+    case 'rankings': {
+      const names = namesRef.current || {}
+      const aggregateRankings = (Array.isArray(event.aggregate) ? event.aggregate : []).map((a) => ({
+        ...a,
+        model_id: a.model,
+        model: names[a.model] || a.model,
+      }))
+      return {
+        ...prev,
+        reviewProgress: { ...prev.reviewProgress, finished: true },
+        aggregate_rankings: aggregateRankings,
+        label_to_model: event.label_to_model || {},
+      }
+    }
     case 'stage3_start':
       return prev
     case 'stage3_result':
@@ -119,6 +139,7 @@ function applyEvent(prev, event, questionText, conversationId, myRunId, namesRef
 
 export default function App() {
   const [view, setView] = useState('chat')
+  const [user, setUser] = useState(getStoredUser)
   const [collapsed, setCollapsed] = useState(() => loadPrefs().collapseSidebar)
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState(null)
@@ -126,6 +147,9 @@ export default function App() {
   const [prefs, setPrefs] = useState(loadPrefs)
   const [lastPayload, setLastPayload] = useState(null)
   const [conversationId, setConversationId] = useState(null)
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const [deleteError, setDeleteError] = useState(null)
   const runIdRef = useRef(0)
   const abortRef = useRef(null)
   const namesRef = useRef({})
@@ -135,6 +159,19 @@ export default function App() {
   const conversationIdRef = useRef(null)
 
   useEffect(() => { savePrefs(prefs) }, [prefs])
+
+  // Authentication lifecycle: restore stored session, verify it against the
+  // backend once on load, and react to login/logout/expiry events.
+  useEffect(() => {
+    verifyToken()
+    const syncUser = () => setUser(getToken() ? getStoredUser() : null)
+    window.addEventListener(AUTH_CHANGED, syncUser)
+    window.addEventListener(AUTH_EXPIRED, syncUser)
+    return () => {
+      window.removeEventListener(AUTH_CHANGED, syncUser)
+      window.removeEventListener(AUTH_EXPIRED, syncUser)
+    }
+  }, [])
 
   const send = useCallback(async ({ question, models, webSearch }) => {
     const questionText = (question || '').trim()
@@ -226,7 +263,7 @@ export default function App() {
       : prev))
   }, [])
 
-  const newSession = useCallback(() => {
+  const clearWorkspace = useCallback(() => {
     runIdRef.current += 1
     abortRef.current?.abort()
     abortRef.current = null
@@ -235,9 +272,47 @@ export default function App() {
     conversationIdRef.current = null
     setConversationId(null)
     setLastPayload(null)
+  }, [])
+
+  const newSession = useCallback(() => {
+    clearWorkspace()
     setView('chat')
     setFocusSignal((v) => v + 1)
+  }, [clearWorkspace])
+
+  const handleLogout = useCallback(async () => {
+    await logoutUser()
+    setUser(null)
+    clearWorkspace()
+    setView('chat')
+  }, [clearWorkspace])
+
+  const requestDelete = useCallback((target) => {
+    setDeleteTarget(target)
+    setDeleteError(null)
   }, [])
+
+  const cancelDelete = useCallback(() => {
+    if (deleteBusy) return
+    setDeleteTarget(null)
+    setDeleteError(null)
+  }, [deleteBusy])
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteTarget || deleteBusy) return
+    setDeleteBusy(true)
+    setDeleteError(null)
+    try {
+      await api.deleteConversation(deleteTarget.id)
+      if (conversationIdRef.current === deleteTarget.id) clearWorkspace()
+      setDeleteTarget(null)
+      emitConversationsChanged()
+    } catch (e) {
+      setDeleteError(`Could not delete conversation. ${e.message || 'Try again.'}`)
+    } finally {
+      setDeleteBusy(false)
+    }
+  }, [deleteTarget, deleteBusy, clearWorkspace])
 
   // Open a saved conversation in the workspace: hydrate the last exchange
   // from persistence so follow-ups continue in the SAME conversation id.
@@ -267,10 +342,16 @@ export default function App() {
     setFocusSignal((v) => v + 1)
   }, [])
 
+  if (!user) {
+    return <LoginView />
+  }
+
   return (
     <div className="flex h-screen overflow-hidden bg-canvas font-sans text-ink">
       <Sidebar
         collapsed={collapsed}
+        user={user}
+        onLogout={handleLogout}
         onToggle={() => {
           const next = !collapsed
           setCollapsed(next)
@@ -280,6 +361,7 @@ export default function App() {
         onViewChange={setView}
         view={view}
         onOpenConversation={continueConversation}
+        onDelete={requestDelete}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -316,7 +398,7 @@ export default function App() {
         ) : (
           <div className="flex-1 overflow-y-auto">
             {view === 'history' && (
-              <HistoryView onContinue={continueConversation} />
+              <HistoryView onContinue={continueConversation} onDelete={requestDelete} />
             )}
             {view === 'library' && (
               <LibraryView
@@ -360,6 +442,14 @@ export default function App() {
           </footer>
         )}
       </div>
+
+      <DeleteConversationDialog
+        conversation={deleteTarget}
+        busy={deleteBusy}
+        error={deleteError}
+        onCancel={cancelDelete}
+        onConfirm={confirmDelete}
+      />
     </div>
   )
 }

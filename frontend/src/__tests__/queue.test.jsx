@@ -20,6 +20,8 @@ import { runCouncilStream } from '../api.js'
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.setItem('cognisync-token', 'test-token')
+  localStorage.setItem('cognisync-user', JSON.stringify({ user_id: 'u1', username: 'tester' }))
   runCouncilStream.mockReset()
 })
 

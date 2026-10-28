@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Icon } from '../icons.jsx'
 import { listConversations, api } from '../api.js'
 import Markdown from '../Markdown.jsx'
@@ -87,29 +87,23 @@ export function ConversationDetails({ id }) {
   )
 }
 
-export default function HistoryView({ onContinue }) {
+export default function HistoryView({ onContinue, onDelete }) {
   const [conversations, setConversations] = useState(null) // null = loading
   const [error, setError] = useState(null)
   const [search, setSearch] = useState('')
   const [expandedIds, setExpandedIds] = useState(() => new Set())
 
-  const refresh = async () => {
-    try {
-      const list = await listConversations()
-      setError(null)
-      setConversations(list)
-    } catch {
-      setError('Could not load conversation history. Is the backend running?')
-    }
-  }
+  const refresh = useCallback(() => {
+    listConversations()
+      .then((list) => { setError(null); setConversations(list) })
+      .catch(() => setError('Could not load conversation history. Is the backend running?'))
+  }, [])
 
   useEffect(() => {
-    let cancelled = false
-    listConversations()
-      .then((list) => { if (!cancelled) { setError(null); setConversations(list) } })
-      .catch(() => { if (!cancelled) setError('Could not load conversation history. Is the backend running?') })
-    return () => { cancelled = true }
-  }, [])
+    refresh()
+    window.addEventListener('cognisync:conversations-changed', refresh)
+    return () => window.removeEventListener('cognisync:conversations-changed', refresh)
+  }, [refresh])
 
   const toggle = (id) => {
     setExpandedIds((prev) => {
@@ -194,6 +188,17 @@ export default function HistoryView({ onContinue }) {
                       className="shrink-0 rounded-lg border border-black/10 px-3 py-1.5 text-[12px] text-neutral-600 hover:border-black/30"
                     >
                       Continue in workspace
+                    </button>
+                  )}
+                  {onDelete && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onDelete({ id: c.id, title: c.title }) }}
+                      aria-label={`Delete ${c.title || 'conversation'}`}
+                      title="Delete conversation"
+                      className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-neutral-400 hover:bg-red-50 hover:text-red-500 sm:h-8 sm:w-8"
+                    >
+                      <Icon name="trash" size={13} />
                     </button>
                   )}
                 </div>

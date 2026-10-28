@@ -4,21 +4,44 @@
 // payload (same contract for the blocking path and history hydration).
 export function mapRunToResults(payload, fallbackQuestion) {
   const { stage1 = [], stage2 = [], stage3 = null, metadata = {}, sources = null } = payload
-  const agg = metadata.aggregate_rankings || []
   const displayName = {}
   for (const s of stage1) {
     if (s.model_id) displayName[s.model_id] = s.model
     displayName[s.model] = s.model
   }
 
+  const labelToModel = metadata.label_to_model || {}
+  const agg = (Array.isArray(metadata.aggregate_rankings) ? metadata.aggregate_rankings : [])
+    .filter((a) => a && Number.isFinite(a.average_rank) && a.rankings_count > 0)
+    .map((a) => ({
+      model_id: a.model,
+      model: displayName[a.model] || a.model,
+      average_rank: a.average_rank,
+      rankings_count: a.rankings_count,
+    }))
+
+  const peerReviews = (Array.isArray(stage2) ? stage2 : []).map((r) => {
+    const parsed = Array.isArray(r.parsed_ranking) ? r.parsed_ranking : []
+    return {
+      model_id: r.model_id || r.model,
+      model: displayName[r.model] || r.model,
+      success: r.success === true,
+      ranking: r.ranking || '',
+      parsed_ranking: parsed,
+      first_place_model_id: parsed[0] ? (labelToModel[parsed[0]] || null) : null,
+    }
+  })
+
   const modelResponses = stage1.map((s) => ({
     model: s.model,
     model_id: s.model_id || s.model,
     time_ms: s.duration_ms || 0,
     tokens: s.tokens || 0,
+    output_tokens: Number.isFinite(s.output_tokens) ? s.output_tokens : null,
     text: s.response || '',
     success: s.success,
     error: s.error || null,
+    error_category: s.error_category || null,
     error_original: s.error_original || null,
     fallback_used: s.fallback_used || null,
     fallback_display: s.fallback_display || null,
@@ -95,9 +118,15 @@ export function mapRunToResults(payload, fallbackQuestion) {
       : (synthesisError || 'Chairman synthesis unavailable.'),
   })
 
+  const criteria = metadata.evaluation?.criteria
+
   return {
     question: fallbackQuestion,
     model_responses: modelResponses,
+    aggregate_rankings: agg,
+    peer_reviews: peerReviews,
+    label_to_model: labelToModel,
+    evaluation_criteria: Array.isArray(criteria) ? criteria : [],
     final_answer: finalAnswer,
     final_answer_error: synthesisError,
     synthesis: finalAnswer || '',
