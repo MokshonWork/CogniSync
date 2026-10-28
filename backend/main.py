@@ -57,7 +57,7 @@ def startup_config_checks():
     explicit COGNISYNC_ENV=production. Local development keeps working with
     the dev fallback so the stack starts with zero configuration.
     """
-    from .config import JWT_SECRET, DATABASE_URL
+    from .config import JWT_SECRET
 
     production = bool(os.getenv("RENDER")) or os.getenv("COGNISYNC_ENV") == "production"
     if JWT_SECRET == INSECURE_JWT_SECRET:
